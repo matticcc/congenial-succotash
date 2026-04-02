@@ -7,12 +7,12 @@ from math import ceil
 
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
-from aiohttp import web, ClientSession
+from aiohttp import web
 from telegram import (
     Update,
     InlineQueryResultArticle,
+    InlineQueryResultPhoto,
     InputTextMessageContent,
-    LinkPreviewOptions,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
@@ -142,10 +142,12 @@ def get_now_playing(sp: spotipy.Spotify) -> dict | None:
 
 def format_caption(data: dict) -> str:
     status = "▶️ Listening to" if data["is_playing"] else "⏸ Paused on"
-    # Route album art through our /img proxy which serves it as image/jpeg
-    # with a .jpg filename — Telegram renders the invisible link as a bare
-    # photo with no preview box, identical to a normally sent photo.
-    art = data.get("album_art") or ""
+    return (
+        f"{status}: <b>{data['track']}</b>\n"
+        f"<i>{data['artists']}</i>\n"
+        f"💿 {data['album']}\n\n"
+        f"<code>{data['bar']}</code>"
+    ) or ""
     if art:
         from urllib.parse import quote
         base = SPOTIFY_REDIRECT_URI.rsplit("/callback", 1)[0]
@@ -246,30 +248,6 @@ async def spotify_callback(request: web.Request) -> web.Response:
 async def healthcheck(request: web.Request) -> web.Response:
     return web.Response(text="OK")
 
-
-async def image_proxy(request: web.Request) -> web.Response:
-    """
-    Proxies a Spotify CDN image served as image/jpeg with a .jpg filename.
-    Telegram sees a direct image URL and renders the invisible link preview
-    as a bare photo with no box — identical to a normal sent photo.
-    Usage: /img?url=https://i.scdn.co/image/xxxxx
-    """
-    img_url = request.rel_url.query.get("url")
-    if not img_url or not img_url.startswith("https://i.scdn.co/"):
-        return web.Response(status=400, text="Bad request")
-    try:
-        async with ClientSession() as session:
-            async with session.get(img_url) as resp:
-                if resp.status != 200:
-                    return web.Response(status=502, text="upstream error")
-                data = await resp.read()
-        return web.Response(
-            body=data,
-            content_type="image/jpeg",
-            headers={"Content-Disposition": 'inline; filename="cover.jpg"'},
-        )
-    except Exception as e:
-        return web.Response(status=500, text=str(e))
 
 
 # ── Telegram handlers ─────────────────────────────────────────────────────────
@@ -375,19 +353,24 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # We embed the user_id in the result id so chosen_inline_result can read it
     result_id = f"{user_id}:{uuid.uuid4()}"
 
-    results = [InlineQueryResultArticle(
+    if data["album_art"]:
+        results = [InlineQueryResultPhoto(
             id=result_id,
+            photo_url=data["album_art"],
+            thumbnail_url=data["album_art"],
             title=f"{data['track']} — {data['artists']}",
             description=data["album"],
-            thumbnail_url=data.get("album_art") or None,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )]
+    else:
+        results = [InlineQueryResultArticle(
+            id=result_id,
+            title=f"🎵 {data['track']}",
+            description=f"{data['artists']} · {data['album']}",
             input_message_content=InputTextMessageContent(
-                caption,
-                parse_mode=ParseMode.HTML,
-                link_preview_options=LinkPreviewOptions(
-                    is_disabled=False,
-                    prefer_large_media=True,
-                    show_above_text=True,
-                ),
+                caption, parse_mode=ParseMode.HTML
             ),
             reply_markup=keyboard,
         )]
@@ -500,24 +483,7 @@ async def callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("⚠️ Playback error — is Spotify open?", show_alert=True)
         return
 
-    # After any action, wait a moment then refresh the message with updated state
-    await asyncio.sleep(0.5)
-    try:
-        data = get_now_playing(sp)
-        if data:
-            await context.bot.edit_message_text(
-                inline_message_id=inline_message_id,
-                text=format_caption(data),
-                parse_mode=ParseMode.HTML,
-                reply_markup=make_keyboard(data, owner_id),
-                link_preview_options=LinkPreviewOptions(
-                    is_disabled=False,
-                    prefer_large_media=True,
-                    show_above_text=True,
-                ),
-            )
-    except Exception as e:
-        logger.warning(f"Could not refresh inline message: {e}")
+
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -536,7 +502,6 @@ async def run():
     web_app = web.Application()
     web_app.router.add_get("/",         healthcheck)
     web_app.router.add_get("/callback", spotify_callback)
-    web_app.router.add_get("/img",      image_proxy)
     runner = web.AppRunner(web_app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
